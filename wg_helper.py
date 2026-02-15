@@ -1,5 +1,5 @@
-from flask import Flask, request, render_template_string, redirect, url_for, session, Response
-import os, subprocess, shutil, sys, json
+from flask import Flask, request, render_template_string, redirect, url_for, session, Response, abort
+import os, subprocess, shutil, sys, json, html, secrets
 
 if os.geteuid() != 0:
     print("This script needs to be run as root or sudo, try 'sudo python3 wg_helper.py'")
@@ -7,7 +7,7 @@ if os.geteuid() != 0:
 
 
 # ===================== #
-ADMIN_PASSWORD = ""
+ADMIN_PASSWORD = "CHANGEME"
 # ===================== #
 
 
@@ -19,9 +19,27 @@ full_config_file_path = os.path.join(wireguard_dir, config_file)
 SYSCTL_CONF = "/etc/sysctl.conf"
 
 
+@app.before_request
+def check_auth_and_csrf():
+    if request.endpoint in ("login", "static", None):
+        return
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
+    if request.method == "POST":
+        token = session.get("csrf_token")
+        if not token or request.form.get("csrf_token") != token:
+            abort(403)
+
+
+def get_default_interface():
+    result = subprocess.run(["ip", "-o", "-4", "route", "show", "to", "default"], capture_output=True, text=True)
+    parts = result.stdout.split()
+    return parts[4] if len(parts) > 4 else ""
+
+
 default_config = {
     "server": {
-        "server_network_interface": subprocess.run("ip -o -4 route show to default | awk '{print $5}'", shell=True, capture_output=True, text=True).stdout.strip(),
+        "server_network_interface": get_default_interface(),
         "Endpoint": "",
         "ListenPort": 51820,
         "PrivateKey": "",
@@ -304,6 +322,7 @@ def login():
     if request.method == "POST":
         if request.form.get("password") == ADMIN_PASSWORD:
             session["logged_in"] = True
+            session["csrf_token"] = secrets.token_hex(32)
             return redirect(url_for("dashboard"))
         else:
             return render_template_string(LOGIN_HTML, error="Incorrect password, please try again")
@@ -312,7 +331,7 @@ def login():
 
 @app.route("/dashboard")
 def dashboard():
-    ensure_logged_in()
+    csrf_token = session.get("csrf_token", "")
     config_data = load_config()
 
     # One liners
@@ -344,7 +363,12 @@ def dashboard():
     
     if is_ufw_installed:
         ufw_path = ufw_get_path()
-        ufw_enabled_status = subprocess.run(f"{ufw_path} status | awk '/Status:/ {{print $2}}'", shell=True, capture_output=True, text=True).stdout.strip()
+        ufw_result = subprocess.run([ufw_path, "status"], capture_output=True, text=True)
+        ufw_enabled_status = ""
+        for line in ufw_result.stdout.splitlines():
+            if "Status:" in line:
+                ufw_enabled_status = line.split()[-1]
+                break
         if ufw_enabled_status == "active":
             ufw_enabled_status = "active"
             ufw_enabled_class = "success"
@@ -372,7 +396,7 @@ def dashboard():
     wg_running_button = ""
     
     if is_wg_installed:
-        wg_running_check = subprocess.run("systemctl is-active wg-quick@wg0", shell=True, capture_output=True, text=True).stdout.strip()
+        wg_running_check = subprocess.run(["systemctl", "is-active", "wg-quick@wg0"], capture_output=True, text=True).stdout.strip()
 
         config_data = load_config()
         server_priv_key = config_data.get("server", {}).get("PrivateKey", "")
@@ -400,7 +424,7 @@ def dashboard():
     wg_enabled_at_boot_class = ""
     wg_enabled_at_boot_button = ""
     
-    wg_enabled_at_boot_check = subprocess.run(f"systemctl is-enabled wg-quick@wg0", shell=True, capture_output=True, text=True).stdout.strip()
+    wg_enabled_at_boot_check = subprocess.run(["systemctl", "is-enabled", "wg-quick@wg0"], capture_output=True, text=True).stdout.strip()
     if wg_enabled_at_boot_check == "enabled":
         wg_enabled_at_boot_status = "Enabled"
         wg_enabled_at_boot_class = "success"
@@ -418,7 +442,12 @@ def dashboard():
     
     if is_ufw_installed and ufw_enabled_status == "active":
         ufw_path = ufw_get_path()
-        ufw_wg_port_check = subprocess.run(f"{ufw_path} status | awk '/51820/ {{print $2; exit}}'", shell=True, capture_output=True, text=True).stdout.strip()
+        ufw_port_result = subprocess.run([ufw_path, "status"], capture_output=True, text=True)
+        ufw_wg_port_check = ""
+        for line in ufw_port_result.stdout.splitlines():
+            if "51820" in line:
+                ufw_wg_port_check = line.split()[1]
+                break
         if ufw_wg_port_check == "":
             ufw_port_status = "Not added"
             ufw_port_class = "danger"
@@ -433,7 +462,7 @@ def dashboard():
         ufw_port_button = ""
 
     # Endpoint data
-    server_endpoint_data = config_data.get("server", {}).get("Endpoint", "")
+    server_endpoint_data = html.escape(config_data.get("server", {}).get("Endpoint", ""))
     if server_endpoint_data == "":
         server_endpoint_form = """
         <form action="/update_server_endpoint" method="POST" class="option-form">
@@ -451,8 +480,9 @@ def dashboard():
         """
 
     # Server public key
-    server_public_key = config_data.get("server", {}).get("PublicKey", "")
+    server_public_key = html.escape(config_data.get("server", {}).get("PublicKey", ""))
     if server_public_key == "":
+
         server_public_key_form = f"""
         <span class="warning">No Keys set</span>
         <form action="/regenerate_server_keys" method="POST" class="option-form">
@@ -472,8 +502,8 @@ def dashboard():
     peer_config = config_data.get("peers", [])
     for peer in peer_config:
         peer_id = peer["id"]
-        peer_name = peer["name"]
-        peer_public_key = peer["PublicKey"]
+        peer_name = html.escape(peer["name"])
+        peer_public_key = html.escape(peer["PublicKey"])
 
         peers_list += f"""
         <div class="peer-item">
@@ -589,6 +619,17 @@ def dashboard():
                 {peers_list if peers_list else '<p>No peers configured yet. Create your first peer above.</p>'}
             </div>
         </div>
+        <script>
+        document.querySelectorAll('form').forEach(function(f) {{
+            if (f.method === 'post') {{
+                var i = document.createElement('input');
+                i.type = 'hidden';
+                i.name = 'csrf_token';
+                i.value = '{csrf_token}';
+                f.appendChild(i);
+            }}
+        }});
+        </script>
     </body>
     </html>
     """
@@ -601,14 +642,10 @@ def logout():
     return redirect(url_for("login"))
 
 
-def ensure_logged_in():
-    if not session.get("logged_in"):
-        return redirect(url_for("login"))
-
 
 @app.route("/install_wireguard", methods=["POST"])
 def install_wireguard():
-    ensure_logged_in()
+
 
     try:
         subprocess.check_call(["sudo", "apt", "install", "-y", "wireguard"])
@@ -639,7 +676,7 @@ def install_wireguard():
 
 @app.route("/install_iptables", methods=["POST"])
 def install_iptables():
-    ensure_logged_in()
+
 
     try:
         subprocess.check_call(["sudo", "apt", "install", "-y", "iptables"])
@@ -670,7 +707,7 @@ def install_iptables():
 
 @app.route("/update_server_endpoint", methods=["POST"])
 def update_server_endpoint():
-    ensure_logged_in()
+
     
     new_endpoint = request.form.get("endpoint", "").strip()
 
@@ -684,7 +721,7 @@ def update_server_endpoint():
 
 @app.route("/ufw_open_port", methods=["POST"])
 def ufw_open_port():
-    ensure_logged_in()
+
 
     ufw_path = ufw_get_path()
 
@@ -776,8 +813,10 @@ def create_new_peer():
 
 @app.route("/delete_peer", methods=["POST"])
 def delete_peer():
-    peer_id_to_delete = request.form.get("peer_id_to_delete", "").strip()
-    peer_id_to_delete = int(peer_id_to_delete)
+    try:
+        peer_id_to_delete = int(request.form.get("peer_id_to_delete", "").strip())
+    except (ValueError, TypeError):
+        return "Invalid peer ID", 400
     config_data = load_config()
     peer_config = config_data.get("peers", [])
 
@@ -794,8 +833,10 @@ def delete_peer():
 
 @app.route("/download_peer_config", methods=["POST"])
 def download_peer_config():
-    peer_id_to_download = request.form.get("peer_id", "").strip()
-    peer_id_to_download = int(peer_id_to_download)
+    try:
+        peer_id_to_download = int(request.form.get("peer_id", "").strip())
+    except (ValueError, TypeError):
+        return "Invalid peer ID", 400
 
     config_data = load_config()
     peer_config = config_data.get("peers", [])
@@ -819,17 +860,18 @@ def download_peer_config():
     interface = config_data["server"]["server_network_interface"]
 
     # Compose the WireGuard peer config
-    config_text = f"""[Interface]
-    PrivateKey = {peer_priv_key}
-    Address = 10.0.0.{peer_id_to_download}/32
-    DNS = 1.1.1.1
-
-[Peer]
-    PublicKey = {server_pub_key}
-    Endpoint = {endpoint}:{listen_port}
-    AllowedIPs = 0.0.0.0/0
-    PersistentKeepalive = 25
-    """
+    config_text = (
+        f"[Interface]\n"
+        f"PrivateKey = {peer_priv_key}\n"
+        f"Address = 10.11.0.{peer_id_to_download}/32\n"
+        f"DNS = 1.1.1.1\n"
+        f"\n"
+        f"[Peer]\n"
+        f"PublicKey = {server_pub_key}\n"
+        f"Endpoint = {endpoint}:{listen_port}\n"
+        f"AllowedIPs = 0.0.0.0/0\n"
+        f"PersistentKeepalive = 25\n"
+    )
 
     # Create response with downloadable config file
     filename = f"peer_{peer_name}.conf"
@@ -868,9 +910,9 @@ def ufw_get_path():
 
 
 def iptables_get_path():
-    ufw_dirs = ["/sbin", "/usr/sbin", "/bin", "/usr/bin", "/usr/local/sbin", "/usr/local/bin"]
+    iptables_dirs = ["/sbin", "/usr/sbin", "/bin", "/usr/bin", "/usr/local/sbin", "/usr/local/bin"]
 
-    for dir in ufw_dirs:
+    for dir in iptables_dirs:
         path = os.path.join(dir, "iptables")
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
@@ -935,8 +977,8 @@ def load_config():
     try:
         with open(full_config_file_path, "r") as f:
             return json.load(f)
-    except:
-        return(0)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default_config.copy()
 
 
 def update_config(config_data):
@@ -950,26 +992,28 @@ def update_config(config_data):
     server_network_interface = config_data.get("server", {}).get("server_network_interface", "")
 
 
-    wg_config_content = f"""[Interface]
-        Address = 10.0.0.1/24
-        SaveConfig = true
-        PostUp = {iptables_get_path()} -A FORWARD -i %i -j ACCEPT; {iptables_get_path()} -t nat -A POSTROUTING -o {server_network_interface} -j MASQUERADE
-        PostDown = {iptables_get_path()} -D FORWARD -i %i -j ACCEPT; {iptables_get_path()} -t nat -D POSTROUTING -o {server_network_interface} -j MASQUERADE
-        ListenPort = 51820
-        PrivateKey = {server_priv_key}
-        """
+    iptables_path = iptables_get_path()
+    wg_config_content = (
+        f"[Interface]\n"
+        f"Address = 10.11.0.1/24\n"
+        f"SaveConfig = true\n"
+        f"PostUp = {iptables_path} -A FORWARD -i %i -j ACCEPT; {iptables_path} -t nat -A POSTROUTING -o {server_network_interface} -j MASQUERADE\n"
+        f"PostDown = {iptables_path} -D FORWARD -i %i -j ACCEPT; {iptables_path} -t nat -D POSTROUTING -o {server_network_interface} -j MASQUERADE\n"
+        f"ListenPort = 51820\n"
+        f"PrivateKey = {server_priv_key}\n"
+    )
 
     for peer in peers:
         peer_id = peer["id"]
         peer_name = peer["name"]
         peer_pub_key = peer["PublicKey"]
-        peer_priv_key = peer["PrivateKey"]
 
-        wg_config_content += f"""
-[Peer]
-        PublicKey = {peer_pub_key}
-        AllowedIPs = 10.0.0.{peer_id}/32
-        """
+        wg_config_content += (
+            f"\n# {peer_name}\n"
+            f"[Peer]\n"
+            f"PublicKey = {peer_pub_key}\n"
+            f"AllowedIPs = 10.11.0.{peer_id}/32\n"
+        )
 
     subprocess.run(["systemctl", "stop", "wg-quick@wg0"], text=True)
     with open("/etc/wireguard/wg0.conf", "w") as f:
