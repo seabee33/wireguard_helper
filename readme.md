@@ -34,7 +34,7 @@ sudo apt install curl python3-flask -y
 curl -L -o wg_helper.py https://raw.githubusercontent.com/seabee33/wireguard_helper/main/wg_helper.py
 ```
 
-3. **Set the admin password** on **line 10** of the file: `ADMIN_PASSWORD = "your_secure_password_here"`
+3. **Set the admin password** on **line 10** of the file: `ADMIN_PASSWORD = "CHANGEME"`
     
 4. **Run the script with sudo or as root** `sudo python3 wg_helper.py`
 
